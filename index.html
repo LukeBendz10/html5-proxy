@@ -6,27 +6,39 @@
   <title>My HTML5 Proxy</title>
   <style>
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    body { display: flex; flex-direction: column; }
     form { display: flex; gap: 8px; padding: 8px; background: #1e293b; }
     input { flex: 1; padding: 8px 12px; border: 0; border-radius: 6px; font-size: 14px; }
-    button { padding: 8px 16px; border: 0; border-radius: 6px; background: #22c55e; color: #fff; font-weight: 600; cursor: pointer; }
+    button { padding: 8px 14px; border: 0; border-radius: 6px; background: #22c55e; color: #fff; font-weight: 600; cursor: pointer; }
+    button.alt { background: #475569; }
     iframe { flex: 1; border: 0; width: 100%; background: #fff; }
   </style>
 </head>
 <body>
   <form id="f">
-    <input id="u" type="text" placeholder="Enter a URL, e.g. example.com" autofocus>
+    <input id="u" type="text" placeholder="Enter a URL or search, e.g. shellshock.io" autofocus>
     <button>Go</button>
+    <button type="button" class="alt" id="o" title="Open in a new tab (best for games)">&#8599;</button>
   </form>
-  <iframe id="view" title="Proxied page"></iframe>
+  <iframe id="view" title="Proxied page" allowfullscreen
+          allow="fullscreen; autoplay; gamepad; clipboard-write; microphone; camera"></iframe>
 
   <script>
-    document.getElementById('f').addEventListener('submit', e => {
+    function target() {
+      var v = document.getElementById('u').value.trim();
+      if (!v) return null;
+      var url = /^https?:\/\//i.test(v) ? v
+        : /^[^\s]+\.[^\s]{2,}$/.test(v) ? 'https://' + v
+        : 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(v);
+      return '/proxy?url=' + encodeURIComponent(url);
+    }
+    document.getElementById('f').addEventListener('submit', function (e) {
       e.preventDefault();
-      let url = document.getElementById('u').value.trim();
-      if (!url) return;
-      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-      document.getElementById('view').src = '/proxy?url=' + encodeURIComponent(url);
+      var t = target(); if (t) document.getElementById('view').src = t;
+    });
+    document.getElementById('o').addEventListener('click', function () {
+      var t = target(); if (t) window.open(t, '_blank');
     });
   </script>
 </body>
