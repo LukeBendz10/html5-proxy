@@ -135,24 +135,65 @@ function rewriteHtml(html, base) {
 const rewriteCss = (css, base) => css.replace(/url\((['"]?)(?!data:|blob:)(.*?)\1\)/gi,
   (m, q, val) => `url(${q}${proxify(val, base)}${q})`);
 
-function sendBuffered(req, res, status, mime, body) {
-  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
-  const gz = /\bgzip\b/.test(req.headers['accept-encoding'] || '') && buf.length > 1024 && COMPRESSIBLE.test(mime);
-  if (!gz) { res.writeHead(status); return res.end(buf); }
-  zlib.gzip(buf, { level: 5 }, (err, out) => {
-    if (err) { res.writeHead(status); return res.end(buf); }
-    res.setHeader('Content-Encoding', 'gzip');
-    res.setHeader('Vary', 'Accept-Encoding');
-    res.writeHead(status); res.end(out);
+// ---- Cache: static assets are kept in memory so repeat loads skip the upstream fetch + compression
+const cache = new Map();
+let cacheBytes = 0;
+const CACHE_MAX = 60e6, CACHE_ITEM_MAX = 8e6, CACHE_TTL = 20 * 60e3;
+const CACHEABLE = /^(image\/|font\/|audio\/|model\/|application\/(wasm|javascript|x-javascript|font-woff2?|vnd\.ms-fontobject)|text\/(javascript|css))/;
+
+function cacheDrop(key) {
+  const e = cache.get(key);
+  if (e) { cacheBytes -= e.size; cache.delete(key); }
+}
+function cacheGet(key) {
+  const e = cache.get(key);
+  if (!e) return null;
+  if (e.exp < Date.now()) { cacheDrop(key); return null; }
+  cache.delete(key); cache.set(key, e); // refresh LRU order
+  return e;
+}
+function cachePut(key, e) {
+  if (e.raw.length > CACHE_ITEM_MAX) return;
+  cacheDrop(key);
+  while (cacheBytes + e.size > CACHE_MAX && cache.size) cacheDrop(cache.keys().next().value);
+  e.key = key; cache.set(key, e); cacheBytes += e.size;
+}
+
+const applyHdrs = (res, hdrs) => { for (const [k, v] of Object.entries(hdrs)) { try { res.setHeader(k, v); } catch {} } };
+
+// Send a buffered body, gzip at level 1 (cheap on a weak CPU); the compressed copy is cached too
+function serveEntry(req, res, e) {
+  applyHdrs(res, e.hdrs);
+  const wantsGz = /\bgzip\b/.test(req.headers['accept-encoding'] || '') && e.raw.length > 1024 && COMPRESSIBLE.test(e.mime);
+  if (!wantsGz) { res.writeHead(e.status); return res.end(e.raw); }
+  res.setHeader('Content-Encoding', 'gzip');
+  res.setHeader('Vary', 'Accept-Encoding');
+  if (e.gz) { res.writeHead(e.status); return res.end(e.gz); }
+  zlib.gzip(e.raw, { level: 1 }, (err, out) => {
+    if (err) { res.removeHeader('Content-Encoding'); res.writeHead(e.status); return res.end(e.raw); }
+    e.gz = out;
+    if (e.key && cache.get(e.key) === e) { e.size += out.length; cacheBytes += out.length; }
+    res.writeHead(e.status); res.end(out);
   });
+}
+
+function finish(req, res, status, mime, hdrs, buf, key) {
+  const e = { status, mime, hdrs, raw: buf, gz: null, size: buf.length, exp: Date.now() + CACHE_TTL };
+  if (key) cachePut(key, e);
+  return serveEntry(req, res, e);
 }
 
 // ---- HTTP proxy -------------------------------------------------------
 async function handleProxy(req, res, reqUrl) {
+  const t0 = Date.now();
   if (limited(clientIp(req))) { res.writeHead(429); return res.end('Rate limit exceeded'); }
   if (!METHODS.includes(req.method)) { res.writeHead(405); return res.end('Method not allowed'); }
   const target = reqUrl.searchParams.get('url');
   if (!/^https?:\/\//i.test(target || '')) { res.writeHead(400); return res.end('Bad or missing url'); }
+
+  const plainGet = req.method === 'GET' && !req.headers.range;
+  if (plainGet) { const hit = cacheGet(target); if (hit) return serveEntry(req, res, hit); }
+
   try {
     const t = new URL(target);
     const headers = { 'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0', 'Referer': t.origin + '/' };
@@ -164,25 +205,35 @@ async function handleProxy(req, res, reqUrl) {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
     }
     const { res: up, url: finalUrl } = await safeFetch(target, opts);
+    const tUp = Date.now() - t0;
     const mime = (up.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    up.headers.forEach((v, k) => {
-      if (STRIP.includes(k.toLowerCase())) return;
-      try { res.setHeader(k, v); } catch {}
+    res.on('close', () => {
+      const ms = Date.now() - t0;
+      if (ms > 1500) console.log(`slow ${ms}ms (upstream ${tUp}ms) ${mime || '?'} ${target.slice(0, 120)}`);
     });
 
+    const hdrs = {};
+    up.headers.forEach((v, k) => { if (!STRIP.includes(k.toLowerCase())) hdrs[k.toLowerCase()] = v; });
+    const len = Number(up.headers.get('content-length')) || 0;
+    const canCache = plainGet && up.status === 200 && CACHEABLE.test(mime) &&
+      !/no-store|private/i.test(up.headers.get('cache-control') || '') && len <= CACHE_ITEM_MAX;
+
     if (mime === 'text/html' || mime === 'application/xhtml+xml') {
-      res.setHeader('Content-Type', mime + '; charset=utf-8');
-      return sendBuffered(req, res, up.status, mime, rewriteHtml(await up.text(), finalUrl));
+      hdrs['content-type'] = mime + '; charset=utf-8';
+      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteHtml(await up.text(), finalUrl), 'utf8'), null);
     }
     if (mime === 'text/css') {
-      res.setHeader('Content-Type', 'text/css; charset=utf-8');
-      return sendBuffered(req, res, up.status, mime, rewriteCss(await up.text(), finalUrl));
+      hdrs['content-type'] = 'text/css; charset=utf-8';
+      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteCss(await up.text(), finalUrl), 'utf8'), canCache ? target : null);
     }
-    if (up.status !== 206 && up.body && req.method !== 'HEAD' && COMPRESSIBLE.test(mime)) {
-      return sendBuffered(req, res, up.status, mime, Buffer.from(await up.arrayBuffer()));
+    if (req.method === 'HEAD' || !up.body) {
+      applyHdrs(res, hdrs); res.writeHead(up.status); return res.end();
     }
+    if (up.status !== 206 && (COMPRESSIBLE.test(mime) || canCache)) {
+      return finish(req, res, up.status, mime, hdrs, Buffer.from(await up.arrayBuffer()), canCache ? target : null);
+    }
+    applyHdrs(res, hdrs);
     res.writeHead(up.status);
-    if (!up.body || req.method === 'HEAD') return res.end();
     const stream = Readable.fromWeb(up.body);
     stream.on('error', () => res.destroy());
     res.on('close', () => stream.destroy());
