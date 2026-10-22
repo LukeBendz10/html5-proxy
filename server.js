@@ -9,6 +9,7 @@ const dns = require('dns').promises;
 const net = require('net');
 const { Readable } = require('stream');
 const { WebSocketServer, WebSocket } = require('ws');
+const { parse, serialize } = require('parse5');
 
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.PORT ? '0.0.0.0' : '127.0.0.1';
@@ -16,6 +17,8 @@ const RATE_LIMIT = 600;          // HTTP requests per minute per IP (pages load 
 const MAX_BODY = 5e6;            // max POST body
 const MAX_WS_PER_IP = 6;         // simultaneous WebSocket tunnels per IP
 const MAX_WS_MSG = 2 * 1024 * 1024;
+const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS) || 20000; // wait for response headers
+const PARSER_MAX_HTML = 1.5e6;   // bigger pages use the faster (less precise) regex rewriter
 const METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'];
 const STRIP = ['content-security-policy', 'content-security-policy-report-only',
   'x-frame-options', 'content-encoding', 'content-length', 'transfer-encoding',
@@ -42,13 +45,17 @@ async function assertPublic(hostname) {
   if (addrs.some(a => isPrivate(a.address))) throw new Error('Blocked: private address');
 }
 
-// Manual redirects so every hop is checked against private ranges
+// Manual redirects so every hop is checked against private ranges; times out if no headers arrive
 async function safeFetch(url, opts) {
   for (let hop = 0; hop < 6; hop++) {
     const u = new URL(url);
     if (!/^https?:$/.test(u.protocol)) throw new Error('Only http/https allowed');
     await assertPublic(u.hostname);
-    const res = await fetch(url, { ...opts, redirect: 'manual' });
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), UPSTREAM_TIMEOUT);
+    let res;
+    try { res = await fetch(url, { ...opts, redirect: 'manual', signal: ctl.signal }); }
+    finally { clearTimeout(timer); }
     const loc = res.headers.get('location');
     if (res.status >= 300 && res.status < 400 && loc) {
       url = new URL(loc, url).href;
@@ -72,6 +79,14 @@ const readBody = req => new Promise((resolve, reject) => {
   req.on('end', () => resolve(Buffer.concat(chunks)));
   req.on('error', reject);
 });
+
+// Decode using the charset the site declares (falls back to UTF-8)
+async function bodyText(up) {
+  const buf = Buffer.from(await up.arrayBuffer());
+  const m = /charset=([^;]+)/i.exec(up.headers.get('content-type') || '');
+  try { return new TextDecoder(m ? m[1].trim().replace(/["']/g, '') : 'utf-8').decode(buf); }
+  catch { return buf.toString('utf8'); }
+}
 
 // ---- Rewriting --------------------------------------------------------
 const proxify = (u, base) => {
@@ -119,21 +134,89 @@ document.addEventListener('submit',function(e){
  location.href=P(u.href)},true);
 })();</script>`;
 
-function rewriteHtml(html, base) {
+const injectClient = (out, base) => {
+  const inject = CLIENT.replace('__BASE__', () => JSON.stringify(base).replace(/</g, '\\u003c'));
+  return /<head[^>]*>/i.test(out) ? out.replace(/<head[^>]*>/i, m => m + inject) : inject + out;
+};
+
+const rewriteCss = (css, base) => css.replace(/url\((['"]?)(?!data:|blob:)(.*?)\1\)/gi,
+  (m, q, val) => `url(${q}${proxify(val, base)}${q})`);
+
+// --- Parser-based HTML rewriting (precise: handles unquoted attributes, <base>, inline scripts safely)
+const SKIP_URL = /^(#|data:|blob:|javascript:|mailto:|tel:|about:)/i;
+const rwUrl = (v, base) => { const s = v.trim(); return (!s || SKIP_URL.test(s)) ? v : proxify(s, base); };
+const rwSrcset = (v, base) => v.split(',').map(s => {
+  const p = s.trim().split(/\s+/); if (p[0]) p[0] = rwUrl(p[0], base); return p.join(' ');
+}).join(', ');
+const URL_ATTRS = ['href', 'src', 'action', 'poster', 'formaction', 'background'];
+
+function collectElements(root) {
+  const els = [], stack = [root];
+  while (stack.length) {
+    const n = stack.pop();
+    if (n.tagName) els.push(n);
+    const kids = n.content ? n.content.childNodes : n.childNodes;
+    if (kids) for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+  }
+  return els;
+}
+function detach(n) {
+  const p = n.parentNode;
+  if (p) { const i = p.childNodes.indexOf(n); if (i >= 0) p.childNodes.splice(i, 1); }
+}
+
+function rewriteHtmlParsed(html, base) {
+  const doc = parse(html);
+  const els = collectElements(doc);
+
+  // Honor <base href> ourselves, then remove it so the browser doesn't apply it to proxied URLs
+  let eff = base;
+  const baseEl = els.find(n => n.tagName === 'base' && n.attrs.some(a => a.name === 'href'));
+  if (baseEl) { try { eff = new URL(baseEl.attrs.find(a => a.name === 'href').value, base).href; } catch {} }
+
+  for (const n of els) {
+    const tag = n.tagName;
+    if (tag === 'base') { detach(n); continue; }
+    if (tag === 'meta') {
+      const he = (n.attrs.find(a => a.name === 'http-equiv') || {}).value || '';
+      const content = n.attrs.find(a => a.name === 'content');
+      if (/^content-security-policy/i.test(he)) { detach(n); continue; }
+      if (/^refresh$/i.test(he) && content) {
+        content.value = content.value.replace(/(url\s*=\s*)(['"]?)([^'";]+)\2/i,
+          (m, p, q, u) => p + q + proxify(u.trim(), eff) + q);
+      }
+      continue;
+    }
+    for (const a of n.attrs) {
+      const nm = a.name;
+      if (URL_ATTRS.includes(nm)) a.value = rwUrl(a.value, eff);
+      else if (nm === 'data' && tag === 'object') a.value = rwUrl(a.value, eff);
+      else if (nm === 'srcset' || nm === 'imagesrcset') a.value = rwSrcset(a.value, eff);
+      else if (nm === 'style') a.value = rewriteCss(a.value, eff);
+    }
+    n.attrs = n.attrs.filter(a => a.name !== 'integrity'); // rewritten content would fail SRI checks
+    if (tag === 'style') for (const c of n.childNodes) if (c.nodeName === '#text') c.value = rewriteCss(c.value, eff);
+  }
+  return injectClient(serialize(doc), eff);
+}
+
+// --- Regex fallback for very large pages or parser failures
+function rewriteHtmlRegex(html, base) {
   const out = html
     .replace(/<meta[^>]+http-equiv=["']?content-security-policy[^>]*>/gi, '')
     .replace(/\b(href|src|action)=("|')(?!#|data:|blob:|javascript:|mailto:)(.*?)\2/gi,
       (m, attr, q, val) => `${attr}=${q}${proxify(val, base)}${q}`)
-    .replace(/\bsrcset=("|')(.*?)\1/gi, (m, q, val) => `srcset=${q}` +
-      val.split(',').map(s => { const p = s.trim().split(/\s+/); p[0] = proxify(p[0], base); return p.join(' '); }).join(', ') + q)
+    .replace(/\bsrcset=("|')(.*?)\1/gi, (m, q, val) => `srcset=${q}${rwSrcset(val, base)}${q}`)
     .replace(/url\((['"]?)(?!data:|blob:)(.*?)\1\)/gi,
       (m, q, val) => `url(${q}${proxify(val, base)}${q})`);
-  const inject = CLIENT.replace('__BASE__', () => JSON.stringify(base).replace(/</g, '\\u003c'));
-  return /<head[^>]*>/i.test(out) ? out.replace(/<head[^>]*>/i, m => m + inject) : inject + out;
+  return injectClient(out, base);
 }
 
-const rewriteCss = (css, base) => css.replace(/url\((['"]?)(?!data:|blob:)(.*?)\1\)/gi,
-  (m, q, val) => `url(${q}${proxify(val, base)}${q})`);
+function rewriteHtml(html, base) {
+  if (html.length > PARSER_MAX_HTML) return rewriteHtmlRegex(html, base);
+  try { return rewriteHtmlParsed(html, base); }
+  catch { return rewriteHtmlRegex(html, base); }
+}
 
 // ---- Cache: static assets are kept in memory so repeat loads skip the upstream fetch + compression
 const cache = new Map();
@@ -183,6 +266,34 @@ function finish(req, res, status, mime, hdrs, buf, key) {
   return serveEntry(req, res, e);
 }
 
+// ---- Friendly error page ----------------------------------------------
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function explain(e) {
+  const c = e.cause || {};
+  const code = c.code || (c.errors && c.errors[0] && c.errors[0].code) || e.code || '';
+  const msg = String(e.message || '') + ' ' + String(c.message || '');
+  if (/bad port/i.test(msg)) return ['Port not allowed', 'That port is on the safety block list for web requests, so it cannot be loaded.'];
+  if (/private address/i.test(msg)) return ['Address not allowed', 'That address points at a private or internal network, which this proxy refuses to reach.'];
+  if (e.name === 'AbortError' || /TIMEOUT|ETIMEDOUT/i.test(code)) return ['The site took too long', 'The site did not answer in time. It may be down, slow, or turning away traffic from servers like this one. Try again in a moment.'];
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return ['Site not found', 'No site exists at that address. Check it for typos.'];
+  if (code === 'ECONNREFUSED' || code === 'ECONNRESET') return ['The site refused the connection', 'The site is down, or it is turning away connections from this server.'];
+  if (/CERT|SSL|TLS/i.test(code + msg)) return ['Security certificate problem', "The site's HTTPS certificate could not be verified, so the proxy will not load it."];
+  if (/Too many redirects/i.test(msg)) return ['Too many redirects', 'The site kept redirecting in a loop.'];
+  return ['Could not load that page', msg || 'Unknown error.'];
+}
+
+const errorPage = (title, detail, target) => `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;padding:20px}
+.c{max-width:520px;background:#111c33;border:1px solid #2a3956;border-radius:16px;padding:28px}
+h1{margin:0 0 8px;font-size:22px}p{color:#94a3b8;line-height:1.5;font-size:14px}
+code{display:block;word-break:break-all;background:#0b1428;border-radius:8px;padding:8px 10px;color:#cbd5e1;font-size:12px;margin:12px 0}
+button{cursor:pointer;border:0;border-radius:10px;padding:10px 16px;font-weight:600;margin-right:8px}.p{background:#22c55e;color:#04210f}.g{background:#1a2848;color:#e2e8f0}
+small{display:block;margin-top:16px;color:#64748b;font-size:12px;line-height:1.5}</style></head>
+<body><div class="c"><h1>${esc(title)}</h1><p>${esc(detail)}</p><code>${esc(target || '')}</code>
+<button class="p" onclick="location.reload()">Try again</button><button class="g" onclick="history.back()">Go back</button>
+<small>Sites that depend heavily on JavaScript or logins (big video, chat, and account sites) often will not work through this proxy.</small></div></body></html>`;
+
 // ---- HTTP proxy -------------------------------------------------------
 async function handleProxy(req, res, reqUrl) {
   const t0 = Date.now();
@@ -220,11 +331,11 @@ async function handleProxy(req, res, reqUrl) {
 
     if (mime === 'text/html' || mime === 'application/xhtml+xml') {
       hdrs['content-type'] = mime + '; charset=utf-8';
-      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteHtml(await up.text(), finalUrl), 'utf8'), null);
+      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteHtml(await bodyText(up), finalUrl), 'utf8'), null);
     }
     if (mime === 'text/css') {
       hdrs['content-type'] = 'text/css; charset=utf-8';
-      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteCss(await up.text(), finalUrl), 'utf8'), canCache ? target : null);
+      return finish(req, res, up.status, mime, hdrs, Buffer.from(rewriteCss(await bodyText(up), finalUrl), 'utf8'), canCache ? target : null);
     }
     if (req.method === 'HEAD' || !up.body) {
       applyHdrs(res, hdrs); res.writeHead(up.status); return res.end();
@@ -239,8 +350,11 @@ async function handleProxy(req, res, reqUrl) {
     res.on('close', () => stream.destroy());
     stream.pipe(res);
   } catch (e) {
-    if (!res.headersSent) res.writeHead(502);
-    res.end('Fetch failed: ' + e.message);
+    const [title, detail] = explain(e);
+    if (res.headersSent) return res.end();
+    const wantsHtml = /text\/html/.test(req.headers.accept || '');
+    res.writeHead(502, { 'Content-Type': wantsHtml ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' });
+    res.end(wantsHtml ? errorPage(title, detail, target) : `${title}: ${detail}`);
   }
 }
 
