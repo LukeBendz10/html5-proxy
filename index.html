@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My HTML5 Proxy</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+    form { display: flex; gap: 8px; padding: 8px; background: #1e293b; }
+    input { flex: 1; padding: 8px 12px; border: 0; border-radius: 6px; font-size: 14px; }
+    button { padding: 8px 16px; border: 0; border-radius: 6px; background: #22c55e; color: #fff; font-weight: 600; cursor: pointer; }
+    iframe { flex: 1; border: 0; width: 100%; background: #fff; }
+  </style>
+</head>
+<body>
+  <form id="f">
+    <input id="u" type="text" placeholder="Enter a URL, e.g. example.com" autofocus>
+    <button>Go</button>
+  </form>
+  <iframe id="view" title="Proxied page"></iframe>
+
+  <script>
+    document.getElementById('f').addEventListener('submit', e => {
+      e.preventDefault();
+      let url = document.getElementById('u').value.trim();
+      if (!url) return;
+      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+      document.getElementById('view').src = '/proxy?url=' + encodeURIComponent(url);
+    });
+  </script>
+</body>
+</html>

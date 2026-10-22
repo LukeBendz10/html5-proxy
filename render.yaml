@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: html5-proxy
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
