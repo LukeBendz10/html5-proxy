@@ -1,9 +1,9 @@
 {
   "name": "html5-proxy",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Web proxy with WebSocket tunneling and an HTML5 front end",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" },
+  "dependencies": { "parse5": "^7.2.1", "ws": "^8.18.0" },
   "engines": { "node": ">=18" }
 }
